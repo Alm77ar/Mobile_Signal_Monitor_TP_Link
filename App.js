@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   StyleSheet, 
   Text, 
@@ -10,26 +10,59 @@ import {
   Modal, 
   TextInput,
   Dimensions,
-  Platform
+  Platform,
+  ScrollView,
+  Alert
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Device from 'expo-device';
+import * as Crypto from 'expo-crypto';
+import * as Application from 'expo-application';
 
 export default function App() {
-  const [signalData, setSignalData] = useState({
-    rsrp: '--',
-    rsrq: '--',
-    snr: '--',
-    band: '--',
-    status: 'Initializing...'
-  });
   const [loading, setLoading] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
 
-  // User Config State
+  // Router Credentials State
   const [routerUrl, setRouterUrl] = useState('http://192.168.1.1');
   const [userId, setUserId] = useState('admin');
   const [password, setPassword] = useState('');
+
+  // Device & Geo-Location Metadata State
+  const [deviceId, setDeviceId] = useState('unknown_device');
+  const [geoData, setGeoData] = useState({
+    ip: 'Offline/Unknown',
+    city: 'Unknown',
+    country: 'Unknown',
+    isp: 'Unknown'
+  });
+
+  // Signal Metrics State (Parity with Python Desktop Script)
+  const [lteBand, setLteBand] = useState('B3');
+  const [nrBand, setNrBand] = useState('n78');
+  const [statusMessage, setStatusMessage] = useState('Initializing...');
+
+  const [metrics, setMetrics] = useState({
+    RSRP: -85,
+    SNR: 18.0,
+    Signal: 80,
+    RSRQ: -10,
+    NR_SSRSRP: -95,
+    NR_SSSINR: 12.0,
+    NR_Signal: 72,
+    NR_SSRSRQ: -12
+  });
+
+  const [stats, setStats] = useState({
+    RSRP: { min: -110, max: -75 },
+    SNR: { min: 4.0, max: 25.0 },
+    Signal: { min: 45, max: 98 },
+    RSRQ: { min: -18, max: -6 },
+    NR_SSRSRP: { min: -118, max: -82 },
+    NR_SSSINR: { min: 0.0, max: 22.0 },
+    NR_Signal: { min: 35, max: 90 },
+    NR_SSRSRQ: { min: -20, max: -8 }
+  });
 
   // Environment variables loaded from .env
   const cloudflareWorkerUrl = process.env.EXPO_PUBLIC_API_URL;
@@ -37,44 +70,88 @@ export default function App() {
 
   useEffect(() => {
     loadSettings();
+    initDeviceAndGeo();
   }, []);
 
-  // Persistent Device Identifier
-  const getDeviceId = async () => {
-    let deviceId = await AsyncStorage.getItem('DEVICE_ID');
-    if (!deviceId) {
-      deviceId = Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
-      await AsyncStorage.setItem('DEVICE_ID', deviceId);
+  // Compute Stable SHA-256 Device Identifier (Matching Python Desktop Logic)
+  const initDeviceAndGeo = async () => {
+    try {
+      let storedHash = await AsyncStorage.getItem('DEVICE_ID_HASH');
+      if (!storedHash) {
+        const rawNativeId = 
+          Application.androidId || 
+          (await Application.getIosIdForVendorAsync()) || 
+          Math.random().toString(36).substring(2);
+        
+        const computedHash = await Crypto.digestStringAsync(
+          Crypto.CryptoDigestAlgorithm.SHA256,
+          String(rawNativeId)
+        );
+        storedHash = computedHash.substring(0, 16);
+        await AsyncStorage.setItem('DEVICE_ID_HASH', storedHash);
+      }
+      setDeviceId(storedHash);
+    } catch (e) {
+      setDeviceId('unknown_device');
     }
-    return deviceId;
+
+    // Resolve Geo & IP Info via ip-api.com
+    try {
+      const response = await fetch('http://ip-api.com/json/', {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Mobile; Android)' }
+      });
+      const data = await response.json();
+      if (data && data.status === 'success') {
+        setGeoData({
+          ip: data.query || 'Unknown',
+          city: data.city || 'Unknown',
+          country: data.country || 'Unknown',
+          isp: data.isp || 'Unknown'
+        });
+      }
+    } catch (err) {
+      // Retain offline fallbacks
+    }
   };
 
   // Dispatch Telemetry Payload to Cloudflare Worker
   const sendTelemetryToCloudflare = async () => {
     if (!cloudflareWorkerUrl || !secretAuthToken) {
-      console.warn('Telemetry skipped: EXPO_PUBLIC_API_URL or EXPO_PUBLIC_CLOUDFLARE_KEY missing in .env');
+      console.warn('Telemetry skipped: EXPO_PUBLIC_API_URL or EXPO_PUBLIC_CLOUDFLARE_KEY missing');
       return;
     }
 
     try {
-      const deviceId = await getDeviceId();
       const { width, height } = Dimensions.get('screen');
 
       const payload = {
-        app_id: 'mobile_signal_monitor',
+        app_id: 'tplink_signal_monitor_mobile',
         device_id: deviceId,
         last_seen: new Date().toISOString(),
         screen_resolution: `${Math.round(width)}x${Math.round(height)}`,
         os: {
           name: Platform.OS === 'android' ? 'Android' : 'iOS',
           release: Device.osVersion || String(Platform.Version),
-          architecture: Platform.arch || 'ARM64'
+          architecture: Platform.arch || Platform.OS
         },
-        network: {
-          ip: 'Auto-Detected',
-          city: 'Auto-Detected',
-          country: 'Auto-Detected',
-          isp: 'Auto-Detected'
+        network: geoData,
+        router_url_target: routerUrl,
+        configured_refresh_rate: 1.5,
+        metrics: {
+          lte: {
+            band: lteBand,
+            rsrp: metrics.RSRP,
+            snr: metrics.SNR,
+            signal: metrics.Signal,
+            rsrq: metrics.RSRQ
+          },
+          nr: {
+            band: nrBand,
+            nr_ssrsrp: metrics.NR_SSRSRP,
+            nr_sssinr: metrics.NR_SSSINR,
+            nr_signal: metrics.NR_Signal,
+            nr_ssrsrq: metrics.NR_SSRSRQ
+          }
         }
       };
 
@@ -91,7 +168,7 @@ export default function App() {
     }
   };
 
-  // Load saved credentials on startup
+  // Load saved settings on app boot
   const loadSettings = async () => {
     try {
       const savedUrl = await AsyncStorage.getItem('ROUTER_URL');
@@ -120,71 +197,101 @@ export default function App() {
 
   const fetchSignalMetrics = async () => {
     setLoading(true);
-    setSignalData(prev => ({ ...prev, status: `Querying ${routerUrl}...` }));
+    setStatusMessage(`Querying ${routerUrl}...`);
 
     try {
       const response = await fetch(`${routerUrl.replace(/\/$/, '')}/api/signal`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, password })
       });
 
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
 
-      setSignalData({
-        rsrp: data.rsrp ? `${data.rsrp} dBm` : '-85 dBm',
-        rsrq: data.rsrq ? `${data.rsrq} dB` : '-10 dB',
-        snr: data.snr ? `${data.snr} dB` : '18 dB',
-        band: data.band || 'B3 / n78',
-        status: 'Connected (Live)'
-      });
+      if (data) {
+        if (data.lte_band) setLteBand(data.lte_band);
+        if (data.nr_band) setNrBand(data.nr_band);
+        
+        setMetrics({
+          RSRP: data.rsrp ?? -85,
+          SNR: data.snr ?? 18.0,
+          Signal: data.signal ?? 80,
+          RSRQ: data.rsrq ?? -10,
+          NR_SSRSRP: data.nr_ssrsrp ?? -95,
+          NR_SSSINR: data.nr_sssinr ?? 12.0,
+          NR_Signal: data.nr_signal ?? 72,
+          NR_SSRSRQ: data.nr_sssrsq ?? -12
+        });
+      }
+      setStatusMessage('Connected (Live)');
     } catch (error) {
-      setSignalData({
-        rsrp: '-85 dBm',
-        rsrq: '-10 dB',
-        snr: '18 dB',
-        band: 'B3 / n78',
-        status: 'Connected (Demo Fallback)'
-      });
+      setStatusMessage('Connected (Demo Fallback)');
     } finally {
       setLoading(false);
-      // Trigger background telemetry dispatch to Cloudflare Worker
       sendTelemetryToCloudflare();
     }
   };
 
+  const renderMetricRow = (label, key, isNR = false) => {
+    const val = metrics[key];
+    const minVal = stats[key]?.min ?? 'N/A';
+    const maxVal = stats[key]?.max ?? 'N/A';
+
+    return (
+      <View key={key} style={styles.metricRow}>
+        <Text style={styles.metricLabel}>{label}</Text>
+        <Text style={[styles.metricValue, isNR ? styles.nrText : styles.lteText]}>
+          {val}
+        </Text>
+        <View style={styles.rangeBox}>
+          <Text style={styles.rangeText}>MAX: {maxVal}</Text>
+          <Text style={styles.rangeText}>MIN: {minVal}</Text>
+        </View>
+      </View>
+    );
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" />
-      <View style={styles.card}>
-        <Text style={styles.header}>TP-Link NX510v Monitor</Text>
-        <Text style={styles.statusText}>Status: {signalData.status}</Text>
+      <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
+      <ScrollView contentContainerStyle={styles.scrollContent}>
+        
+        {/* App Title & Status */}
+        <Text style={styles.headerTitle}>=== SIGNAL MONITOR ===</Text>
+        <Text style={styles.subHeader}>Status: {statusMessage}</Text>
 
-        <View style={styles.metricGrid}>
-          <View style={styles.metricBox}>
-            <Text style={styles.label}>RSRP</Text>
-            <Text style={styles.value}>{signalData.rsrp}</Text>
-          </View>
-          <View style={styles.metricBox}>
-            <Text style={styles.label}>RSRQ</Text>
-            <Text style={styles.value}>{signalData.rsrq}</Text>
-          </View>
+        {/* Device & Network Telemetry Info */}
+        <View style={styles.infoCard}>
+          <Text style={styles.infoTitle}>DEVICE & NETWORK METRICS</Text>
+          <Text style={styles.infoText}>Device ID: {deviceId}</Text>
+          <Text style={styles.infoText}>IP: {geoData.ip} ({geoData.city}, {geoData.country})</Text>
+          <Text style={styles.infoText}>ISP: {geoData.isp}</Text>
         </View>
 
-        <View style={styles.metricGrid}>
-          <View style={styles.metricBox}>
-            <Text style={styles.label}>SINR / SNR</Text>
-            <Text style={styles.value}>{signalData.snr}</Text>
-          </View>
-          <View style={styles.metricBox}>
-            <Text style={styles.label}>Active Band</Text>
-            <Text style={styles.value}>{signalData.band}</Text>
-          </View>
+        {/* LTE Band & Metrics Section */}
+        <View style={styles.sectionCard}>
+          <Text style={styles.lteSectionTitle}>
+            --- LTE SECTION (Band: {lteBand}) ---
+          </Text>
+          {renderMetricRow('RSRP', 'RSRP')}
+          {renderMetricRow('SNR', 'SNR')}
+          {renderMetricRow('Signal', 'Signal')}
+          {renderMetricRow('RSRQ', 'RSRQ')}
         </View>
 
+        {/* NR 5G Band & Metrics Section */}
+        <View style={styles.sectionCard}>
+          <Text style={styles.nrSectionTitle}>
+            --- NR SECTION (Band: {nrBand}) ---
+          </Text>
+          {renderMetricRow('NR RSRP', 'NR_SSRSRP', true)}
+          {renderMetricRow('NR SINR', 'NR_SSSINR', true)}
+          {renderMetricRow('NR Signal', 'NR_Signal', true)}
+          {renderMetricRow('NR RSRQ', 'NR_SSRSRQ', true)}
+        </View>
+
+        {/* Control Buttons */}
         <TouchableOpacity 
           style={[styles.button, loading && styles.buttonDisabled]} 
           onPress={fetchSignalMetrics}
@@ -203,7 +310,8 @@ export default function App() {
         >
           <Text style={styles.settingsButtonText}>⚙️ Router Settings</Text>
         </TouchableOpacity>
-      </View>
+
+      </ScrollView>
 
       {/* Configuration Modal */}
       <Modal visible={modalVisible} animationType="slide" transparent={true}>
@@ -259,52 +367,94 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0f172a',
-    justifyContent: 'center',
-    alignItems: 'center',
+  },
+  scrollContent: {
     padding: 16,
   },
-  card: {
-    width: '100%',
-    backgroundColor: '#1e293b',
-    borderRadius: 12,
-    padding: 20,
-    alignItems: 'center',
-    elevation: 5,
-  },
-  header: {
-    fontSize: 20,
+  headerTitle: {
+    fontSize: 18,
     fontWeight: 'bold',
-    color: '#f8fafc',
+    color: '#38bdf8',
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  subHeader: {
+    fontSize: 13,
+    color: '#94a3b8',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  infoCard: {
+    backgroundColor: '#1e293b',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    borderLeftWidth: 4,
+    borderLeftColor: '#38bdf8',
+  },
+  infoTitle: {
+    color: '#38bdf8',
+    fontSize: 12,
+    fontWeight: 'bold',
     marginBottom: 4,
   },
-  statusText: {
-    fontSize: 14,
-    color: '#38bdf8',
-    marginBottom: 20,
+  infoText: {
+    color: '#cbd5e1',
+    fontSize: 11,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-  metricGrid: {
+  sectionCard: {
+    backgroundColor: '#1e293b',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  lteSectionTitle: {
+    color: '#38bdf8',
+    fontWeight: 'bold',
+    fontSize: 14,
+    marginBottom: 10,
+  },
+  nrSectionTitle: {
+    color: '#4ade80',
+    fontWeight: 'bold',
+    fontSize: 14,
+    marginBottom: 10,
+  },
+  metricRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    width: '100%',
-    marginBottom: 12,
-  },
-  metricBox: {
-    flex: 1,
-    backgroundColor: '#334155',
-    padding: 14,
-    borderRadius: 8,
     alignItems: 'center',
-    marginHorizontal: 4,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: '#334155',
   },
-  label: {
-    fontSize: 12,
-    color: '#94a3b8',
-    marginBottom: 4,
+  metricLabel: {
+    color: '#e2e8f0',
+    fontSize: 13,
+    width: 85,
+    fontWeight: '600',
   },
-  value: {
-    fontSize: 16,
+  metricValue: {
+    fontSize: 14,
     fontWeight: 'bold',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    width: 60,
+  },
+  lteText: {
+    color: '#38bdf8',
+  },
+  nrText: {
     color: '#4ade80',
+  },
+  rangeBox: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  rangeText: {
+    color: '#94a3b8',
+    fontSize: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   button: {
     backgroundColor: '#2563eb',
@@ -312,7 +462,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     width: '100%',
     alignItems: 'center',
-    marginTop: 8,
+    marginTop: 4,
   },
   buttonDisabled: {
     opacity: 0.7,
@@ -325,6 +475,7 @@ const styles = StyleSheet.create({
   settingsButton: {
     marginTop: 12,
     paddingVertical: 10,
+    alignItems: 'center',
   },
   settingsButtonText: {
     color: '#94a3b8',
