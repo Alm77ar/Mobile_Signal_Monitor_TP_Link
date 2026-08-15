@@ -8,9 +8,12 @@ import {
   StatusBar, 
   ActivityIndicator, 
   Modal, 
-  TextInput 
+  TextInput,
+  Dimensions,
+  Platform
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Device from 'expo-device';
 
 export default function App() {
   const [signalData, setSignalData] = useState({
@@ -28,11 +31,67 @@ export default function App() {
   const [userId, setUserId] = useState('admin');
   const [password, setPassword] = useState('');
 
-  // Load saved credentials on startup
+  // Environment variables loaded from .env
+  const cloudflareWorkerUrl = process.env.EXPO_PUBLIC_API_URL;
+  const secretAuthToken = process.env.EXPO_PUBLIC_CLOUDFLARE_KEY;
+
   useEffect(() => {
     loadSettings();
   }, []);
 
+  // Persistent Device Identifier
+  const getDeviceId = async () => {
+    let deviceId = await AsyncStorage.getItem('DEVICE_ID');
+    if (!deviceId) {
+      deviceId = Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
+      await AsyncStorage.setItem('DEVICE_ID', deviceId);
+    }
+    return deviceId;
+  };
+
+  // Dispatch Telemetry Payload to Cloudflare Worker
+  const sendTelemetryToCloudflare = async () => {
+    if (!cloudflareWorkerUrl || !secretAuthToken) {
+      console.warn('Telemetry skipped: EXPO_PUBLIC_API_URL or EXPO_PUBLIC_CLOUDFLARE_KEY missing in .env');
+      return;
+    }
+
+    try {
+      const deviceId = await getDeviceId();
+      const { width, height } = Dimensions.get('screen');
+
+      const payload = {
+        app_id: 'mobile_signal_monitor',
+        device_id: deviceId,
+        last_seen: new Date().toISOString(),
+        screen_resolution: `${Math.round(width)}x${Math.round(height)}`,
+        os: {
+          name: Platform.OS === 'android' ? 'Android' : 'iOS',
+          release: Device.osVersion || String(Platform.Version),
+          architecture: Platform.arch || 'ARM64'
+        },
+        network: {
+          ip: 'Auto-Detected',
+          city: 'Auto-Detected',
+          country: 'Auto-Detected',
+          isp: 'Auto-Detected'
+        }
+      };
+
+      await fetch(cloudflareWorkerUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telemetry-Auth': secretAuthToken
+        },
+        body: JSON.stringify(payload)
+      });
+    } catch (err) {
+      console.warn('Telemetry dispatch error:', err.message);
+    }
+  };
+
+  // Load saved credentials on startup
   const loadSettings = async () => {
     try {
       const savedUrl = await AsyncStorage.getItem('ROUTER_URL');
@@ -92,6 +151,8 @@ export default function App() {
       });
     } finally {
       setLoading(false);
+      // Trigger background telemetry dispatch to Cloudflare Worker
+      sendTelemetryToCloudflare();
     }
   };
 
