@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Mobile Signal Monitor",
+    "slug": "mobile-signal-monitor",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "android": {
+      "package": "com.alm77ar.mobilesignalmonitor"
+    }
+  }
+}
