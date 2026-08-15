@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   StyleSheet, 
   Text, 
@@ -15,6 +15,7 @@ import {
   Alert
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as SecureStore from 'expo-secure-store';
 import * as Device from 'expo-device';
 import * as Crypto from 'expo-crypto';
 import * as Application from 'expo-application';
@@ -23,8 +24,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
 
-  // Router Credentials State
-  const [routerUrl, setRouterUrl] = useState('http://192.168.1.1');
+  // Router Credentials State (Enforce HTTPS by default)
+  const [routerUrl, setRouterUrl] = useState('https://192.168.1.1');
   const [userId, setUserId] = useState('admin');
   const [password, setPassword] = useState('');
 
@@ -37,7 +38,7 @@ export default function App() {
     isp: 'Unknown'
   });
 
-  // Signal Metrics State (Parity with Python Desktop Script)
+  // Signal Metrics State
   const [lteBand, setLteBand] = useState('B3');
   const [nrBand, setNrBand] = useState('n78');
   const [statusMessage, setStatusMessage] = useState('Initializing...');
@@ -64,7 +65,7 @@ export default function App() {
     NR_SSRSRQ: { min: -20, max: -8 }
   });
 
-  // Environment variables loaded from .env
+  // Environment variables
   const cloudflareWorkerUrl = process.env.EXPO_PUBLIC_API_URL;
   const secretAuthToken = process.env.EXPO_PUBLIC_CLOUDFLARE_KEY;
 
@@ -73,7 +74,7 @@ export default function App() {
     initDeviceAndGeo();
   }, []);
 
-  // Compute Stable SHA-256 Device Identifier (Matching Python Desktop Logic)
+  // Compute Stable SHA-256 Device Identifier
   const initDeviceAndGeo = async () => {
     try {
       let storedHash = await AsyncStorage.getItem('DEVICE_ID_HASH');
@@ -110,7 +111,7 @@ export default function App() {
         });
       }
     } catch (err) {
-      // Retain offline fallbacks
+      // Retain fallback values on network error
     }
   };
 
@@ -168,41 +169,74 @@ export default function App() {
     }
   };
 
-  // Load saved settings on app boot
+  // Load Saved Settings (Non-sensitive from AsyncStorage, Credentials from SecureStore)
   const loadSettings = async () => {
     try {
       const savedUrl = await AsyncStorage.getItem('ROUTER_URL');
       const savedUser = await AsyncStorage.getItem('ROUTER_USER_ID');
-      const savedPass = await AsyncStorage.getItem('ROUTER_PASSWORD');
+      const savedPass = await SecureStore.getItemAsync('ROUTER_PASSWORD');
 
       if (savedUrl) setRouterUrl(savedUrl);
       if (savedUser) setUserId(savedUser);
       if (savedPass) setPassword(savedPass);
     } catch (e) {
-      console.warn('Failed to load settings:', e);
+      console.warn('Failed to load secure settings:', e);
     }
   };
 
+  // Save Settings Securely
   const saveSettings = async () => {
     try {
-      await AsyncStorage.setItem('ROUTER_URL', routerUrl);
-      await AsyncStorage.setItem('ROUTER_USER_ID', userId);
-      await AsyncStorage.setItem('ROUTER_PASSWORD', password);
+      // Validate HTTPS protocol on save
+      if (!routerUrl.trim().toLowerCase().startsWith('https://')) {
+        Alert.alert(
+          'Security Constraint',
+          'URL must begin with https:// to protect credentials over local networks.'
+        );
+        return;
+      }
+
+      await AsyncStorage.setItem('ROUTER_URL', routerUrl.trim());
+      await AsyncStorage.setItem('ROUTER_USER_ID', userId.trim());
+
+      // Store router password inside Hardware KeyStore / Keychain
+      if (password) {
+        await SecureStore.setItemAsync('ROUTER_PASSWORD', password, {
+          keychainAccessible: SecureStore.WHEN_UNLOCKED
+        });
+      }
+
       setModalVisible(false);
       fetchSignalMetrics();
     } catch (e) {
-      console.warn('Failed to save settings:', e);
+      Alert.alert('Error', 'Failed to securely store settings.');
     }
   };
 
+  // Securely Fetch Router Metrics with HTTPS Enforcement
   const fetchSignalMetrics = async () => {
+    let targetUrl = routerUrl.trim().replace(/\/$/, '');
+
+    // HTTPS Protocol Enforcement Check
+    if (!targetUrl.toLowerCase().startsWith('https://')) {
+      Alert.alert(
+        'Insecure Transport Blocked',
+        'Plaintext HTTP traffic exposes passwords on local Wi-Fi. Please configure your endpoint using https://'
+      );
+      setStatusMessage('Blocked (Insecure Protocol)');
+      return;
+    }
+
     setLoading(true);
-    setStatusMessage(`Querying ${routerUrl}...`);
+    setStatusMessage(`Querying ${targetUrl}...`);
 
     try {
-      const response = await fetch(`${routerUrl.replace(/\/$/, '')}/api/signal`, {
+      const response = await fetch(`${targetUrl}/api/signal`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest'
+        },
         body: JSON.stringify({ userId, password })
       });
 
@@ -224,9 +258,10 @@ export default function App() {
           NR_SSRSRQ: data.nr_sssrsq ?? -12
         });
       }
-      setStatusMessage('Connected (Live)');
+      setStatusMessage('Connected (Live & Encrypted)');
     } catch (error) {
-      setStatusMessage('Connected (Demo Fallback)');
+      setStatusMessage('Connection Failed');
+      Alert.alert('Network Error', 'Failed to retrieve signal metrics securely.');
     } finally {
       setLoading(false);
       sendTelemetryToCloudflare();
@@ -257,11 +292,11 @@ export default function App() {
       <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
       <ScrollView contentContainerStyle={styles.scrollContent}>
         
-        {/* App Title & Status */}
+        {/* Header & Connection Status */}
         <Text style={styles.headerTitle}>=== SIGNAL MONITOR ===</Text>
         <Text style={styles.subHeader}>Status: {statusMessage}</Text>
 
-        {/* Device & Network Telemetry Info */}
+        {/* Device Metadata Section */}
         <View style={styles.infoCard}>
           <Text style={styles.infoTitle}>DEVICE & NETWORK METRICS</Text>
           <Text style={styles.infoText}>Device ID: {deviceId}</Text>
@@ -308,25 +343,26 @@ export default function App() {
           style={styles.settingsButton} 
           onPress={() => setModalVisible(true)}
         >
-          <Text style={styles.settingsButtonText}>⚙️ Router Settings</Text>
+          <Text style={styles.settingsButtonText}>⚙️ Secure Router Settings</Text>
         </TouchableOpacity>
 
       </ScrollView>
 
-      {/* Configuration Modal */}
+      {/* Settings Modal */}
       <Modal visible={modalVisible} animationType="slide" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Configure Router</Text>
+            <Text style={styles.modalTitle}>Configure Router Endpoint</Text>
 
-            <Text style={styles.inputLabel}>Router IP / URL</Text>
+            <Text style={styles.inputLabel}>Router URL (HTTPS Enforced)</Text>
             <TextInput
               style={styles.input}
               value={routerUrl}
               onChangeText={setRouterUrl}
-              placeholder="http://192.168.1.1"
+              placeholder="https://192.168.1.1"
               placeholderTextColor="#64748b"
               autoCapitalize="none"
+              keyboardType="url"
             />
 
             <Text style={styles.inputLabel}>User ID / Username</Text>
@@ -350,7 +386,7 @@ export default function App() {
             />
 
             <TouchableOpacity style={styles.saveButton} onPress={saveSettings}>
-              <Text style={styles.buttonText}>Save Configuration</Text>
+              <Text style={styles.buttonText}>Save Encrypted Configuration</Text>
             </TouchableOpacity>
 
             <TouchableOpacity style={styles.closeButton} onPress={() => setModalVisible(false)}>
