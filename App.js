@@ -1,5 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, SafeAreaView, StatusBar, ActivityIndicator } from 'react-native';
+import { 
+  StyleSheet, 
+  Text, 
+  View, 
+  TouchableOpacity, 
+  SafeAreaView, 
+  StatusBar, 
+  ActivityIndicator, 
+  Modal, 
+  TextInput 
+} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export default function App() {
   const [signalData, setSignalData] = useState({
@@ -10,79 +21,79 @@ export default function App() {
     status: 'Initializing...'
   });
   const [loading, setLoading] = useState(false);
+  const [modalVisible, setModalVisible] = useState(false);
 
-  // Access Cloudflare key dynamically from environment variable
-  const cloudflareKey = process.env.EXPO_PUBLIC_CLOUDFLARE_KEY;
+  // User Config State
+  const [routerUrl, setRouterUrl] = useState('http://192.168.1.1');
+  const [userId, setUserId] = useState('admin');
+  const [password, setPassword] = useState('');
 
-  // Send Telemetry Payload to Cloudflare Worker
-  const sendTelemetryToCloud = async (metrics) => {
-    const cloudEndpoint = process.env.EXPO_PUBLIC_API_URL || 'https://your-worker.workers.dev/api/telemetry';
+  // Load saved credentials on startup
+  useEffect(() => {
+    loadSettings();
+  }, []);
+
+  const loadSettings = async () => {
     try {
-      await fetch(cloudEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${cloudflareKey}`
-        },
-        body: JSON.stringify({
-          timestamp: new Date().toISOString(),
-          deviceModel: 'TP-Link NX510v',
-          signalMetrics: metrics
-        })
-      });
-    } catch (err) {
-      console.warn('Telemetry dispatch deferred:', err.message);
+      const savedUrl = await AsyncStorage.getItem('ROUTER_URL');
+      const savedUser = await AsyncStorage.getItem('ROUTER_USER_ID');
+      const savedPass = await AsyncStorage.getItem('ROUTER_PASSWORD');
+
+      if (savedUrl) setRouterUrl(savedUrl);
+      if (savedUser) setUserId(savedUser);
+      if (savedPass) setPassword(savedPass);
+    } catch (e) {
+      console.warn('Failed to load settings:', e);
     }
   };
 
-  // Fetch Live Router Metrics & Sync
+  const saveSettings = async () => {
+    try {
+      await AsyncStorage.setItem('ROUTER_URL', routerUrl);
+      await AsyncStorage.setItem('ROUTER_USER_ID', userId);
+      await AsyncStorage.setItem('ROUTER_PASSWORD', password);
+      setModalVisible(false);
+      fetchSignalMetrics();
+    } catch (e) {
+      console.warn('Failed to save settings:', e);
+    }
+  };
+
   const fetchSignalMetrics = async () => {
     setLoading(true);
-    setSignalData(prev => ({ ...prev, status: 'Querying router...' }));
+    setSignalData(prev => ({ ...prev, status: `Querying ${routerUrl}...` }));
 
     try {
-      const routerEndpoint = process.env.EXPO_PUBLIC_ROUTER_URL || 'https://your-worker.workers.dev/api/signal';
-      let liveMetrics;
+      const response = await fetch(`${routerUrl.replace(/\/$/, '')}/api/signal`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ userId, password })
+      });
 
-      try {
-        const response = await fetch(routerEndpoint, {
-          headers: {
-            'Authorization': `Bearer ${cloudflareKey}`
-          }
-        });
-        if (!response.ok) throw new Error(`HTTP status ${response.status}`);
-        const data = await response.json();
-        liveMetrics = {
-          rsrp: data.rsrp ? `${data.rsrp} dBm` : '-85 dBm',
-          rsrq: data.rsrq ? `${data.rsrq} dB` : '-10 dB',
-          snr: data.snr ? `${data.snr} dB` : '18 dB',
-          band: data.band || 'B3 / n78',
-          status: 'Connected (Live)'
-        };
-      } catch (networkErr) {
-        // Fallback demo data for local UI verification
-        liveMetrics = {
-          rsrp: '-85 dBm',
-          rsrq: '-10 dB',
-          snr: '18 dB',
-          band: 'B3 / n78',
-          status: 'Connected (Demo Data)'
-        };
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
 
-      setSignalData(liveMetrics);
-      await sendTelemetryToCloud(liveMetrics);
-
+      setSignalData({
+        rsrp: data.rsrp ? `${data.rsrp} dBm` : '-85 dBm',
+        rsrq: data.rsrq ? `${data.rsrq} dB` : '-10 dB',
+        snr: data.snr ? `${data.snr} dB` : '18 dB',
+        band: data.band || 'B3 / n78',
+        status: 'Connected (Live)'
+      });
     } catch (error) {
-      setSignalData(prev => ({ ...prev, status: 'Connection Error' }));
+      setSignalData({
+        rsrp: '-85 dBm',
+        rsrq: '-10 dB',
+        snr: '18 dB',
+        band: 'B3 / n78',
+        status: 'Connected (Demo Fallback)'
+      });
     } finally {
       setLoading(false);
     }
   };
-
-  useEffect(() => {
-    fetchSignalMetrics();
-  }, []);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -124,7 +135,61 @@ export default function App() {
             <Text style={styles.buttonText}>Refresh & Sync Telemetry</Text>
           )}
         </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={styles.settingsButton} 
+          onPress={() => setModalVisible(true)}
+        >
+          <Text style={styles.settingsButtonText}>⚙️ Router Settings</Text>
+        </TouchableOpacity>
       </View>
+
+      {/* Configuration Modal */}
+      <Modal visible={modalVisible} animationType="slide" transparent={true}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Configure Router</Text>
+
+            <Text style={styles.inputLabel}>Router IP / URL</Text>
+            <TextInput
+              style={styles.input}
+              value={routerUrl}
+              onChangeText={setRouterUrl}
+              placeholder="http://192.168.1.1"
+              placeholderTextColor="#64748b"
+              autoCapitalize="none"
+            />
+
+            <Text style={styles.inputLabel}>User ID / Username</Text>
+            <TextInput
+              style={styles.input}
+              value={userId}
+              onChangeText={setUserId}
+              placeholder="admin"
+              placeholderTextColor="#64748b"
+              autoCapitalize="none"
+            />
+
+            <Text style={styles.inputLabel}>Router Password</Text>
+            <TextInput
+              style={styles.input}
+              value={password}
+              onChangeText={setPassword}
+              placeholder="Enter password"
+              placeholderTextColor="#64748b"
+              secureTextEntry={true}
+            />
+
+            <TouchableOpacity style={styles.saveButton} onPress={saveSettings}>
+              <Text style={styles.buttonText}>Save Configuration</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.closeButton} onPress={() => setModalVisible(false)}>
+              <Text style={styles.closeButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -183,19 +248,70 @@ const styles = StyleSheet.create({
   button: {
     backgroundColor: '#2563eb',
     paddingVertical: 14,
-    paddingHorizontal: 24,
     borderRadius: 8,
     width: '100%',
     alignItems: 'center',
     marginTop: 8,
   },
   buttonDisabled: {
-    backgroundColor: '#1d4ed8',
     opacity: 0.7,
   },
   buttonText: {
     color: '#ffffff',
     fontWeight: '600',
     fontSize: 15,
+  },
+  settingsButton: {
+    marginTop: 12,
+    paddingVertical: 10,
+  },
+  settingsButtonText: {
+    color: '#94a3b8',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 20,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#f8fafc',
+    marginBottom: 16,
+  },
+  inputLabel: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginBottom: 4,
+  },
+  input: {
+    backgroundColor: '#334155',
+    color: '#ffffff',
+    borderRadius: 6,
+    padding: 12,
+    marginBottom: 14,
+  },
+  saveButton: {
+    backgroundColor: '#16a34a',
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  closeButton: {
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  closeButtonText: {
+    color: '#ef4444',
   },
 });
